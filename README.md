@@ -428,6 +428,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS diary(
 
 > 这一节是「摘要记忆」的补充，不是替代。摘要负责「醒来立刻知道自己是谁」，全量原文负责「想起某一天具体说过什么」。
 
+> 💡 **说明**：本节只讲**你自己的数据怎么存、怎么查**，不涉及任何第三方项目的代码或文件。如果你用的是别人开源的聊天转发/客户端项目，请先阅读它自己的 LICENSE，再决定怎么在自己那一侧加东西；本攻略不修改、不重新分发任何第三方项目。
+
 ### 1) 建一张原文表
 
 和记忆表放在同一个数据库里，另开一张：
@@ -449,10 +451,10 @@ c.execute("""CREATE TABLE IF NOT EXISTS messages(
 聊天记录一般能从客户端「导出」成文件。常见两种格式，各写一个解析函数：
 
 - **JSON 导出**（很多客户端是这种）：通常是一个会话数组，每条消息有 `role`、`content`、时间字段。注意**有些节点是空的**（`message` 为 `null`），要判空跳过，否则会报 `'NoneType' object has no attribute 'get'`。
-- **纯文本导出**（人手动复制的）：常见结构是「标题 / 空行 / 时间 · 说话人 / 正文」，块与块之间用 `---` 分隔。解析时注意：
-  - 块开头**可能多一个空行**（`---` 后面跟的是空行），所以先 `strip()` 再匹配；
+- **纯文本导出**（人手动复制的）：常见结构是「标题 / 空行 / 时间 · 说话人 / 正文」，块与块之间用横线分隔。解析时注意：
+  - 块开头**可能多一个空行**，所以先 `strip()` 再匹配；
   - **标题行可有可无**，正则里把标题写成可选组 `(?:(.+?)\n\n)?`；
-  - 分隔符的横线数量不定，用 `-{3,}` 而不是写死 `---`。
+  - 分隔符的横线数量不定，用 `-{3,}` 而不是写死三个横线。
 
 最小解析示例：
 
@@ -492,7 +494,7 @@ def search_chat(q, limit=20):
     kws = [k for k in q.split() if k]          # 空格分开＝多关键词，AND 关系
     if not kws:
         return "（请给关键词）"
-    conn = sqlite3.connect(os.path.expanduser("~/deep---/chat_history.db"))
+    conn = sqlite3.connect(os.path.expanduser("~/chat_history.db"))
     sql = "SELECT ts, speaker, content FROM messages WHERE 1=1"
     args = []
     for k in kws:
@@ -534,37 +536,37 @@ if name == "memory_search_chat":
 
 ### 5) 让「以后」的聊天自动进库（关键一步）
 
-前四步解决的是「过去」。**以后的自动记录**，要在**消息转发层**上做——也就是那个把聊天请求转给模型的服务（本攻略里叫 Gateway / `server.js`）。
+前四步解决的是「过去」。**以后的自动记录**，要在**消息转发层**上做——也就是那个把聊天请求转给模型的服务（不管它是你自建的、还是某个开源项目）。
 
 思路：每次收到聊天请求，**顺手把这一批消息写进 `messages` 表**，再转发给模型。这样只要转发服务在跑，记录就是自动的，不用人管。
 
 **要点**：
-- 在「保存时间线」那行之后插入写库逻辑；
+- 在「保存时间线 / 处理完请求」之后插入写库逻辑；
 - 只取 `user` / `assistant` 两种角色，跳过 `system` / `tool`；
 - 时间戳优先从正文里提取（客户端常把时间写在消息末尾），提不到就用当前时间兜底；
 - 用 `INSERT OR IGNORE` + `uniq` 去重，重复请求不会写两遍；
 - **写库失败不能影响聊天**——整段包在 `try/catch` 里，出错只打日志。
 
-**如果转发服务是 Node.js**，不必为了写 sqlite 去装原生模块（`better-sqlite3` 在 Termux 上编译麻烦）。**直接调系统里的 `python3`** 最省事：
+**如果转发层是 Node.js**，不必为了写 sqlite 去装原生模块（原生模块在 Termux 上编译麻烦）。**直接调系统里的 `python3`** 最省事：
 
 ```javascript
 try {
   const { spawnSync } = require("child_process");
   const rows = [];
-  for (const m of kelivoMessages) {
+  for (const m of incomingMessages) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     const txt = normalizeContentToText(m.content);
     if (!txt || !txt.trim()) continue;
     const t = extractTimestamp(txt) || extractTimestampWithMemory(m, tsDB);
     const ts = t ? new Date(t).toISOString() : new Date().toISOString();
-    const sp = m.role === "user" ? "月月" : "辰辰";
+    const sp = m.role === "user" ? "对方" : "我";
     rows.push({ ts, sp, content: txt });
   }
   if (rows.length) {
     const script =
       "import sys,json,sqlite3,os\n" +
       "d=json.loads(sys.stdin.read())\n" +
-      "p=os.path.expanduser('~/deep---/chat_history.db')\n" +
+      "p=os.path.expanduser('~/chat_history.db')\n" +
       "c=sqlite3.connect(p)\n" +
       "c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, speaker TEXT, content TEXT, uniq TEXT UNIQUE)')\n" +
       "for r in d:\n" +
@@ -579,10 +581,10 @@ try {
 ```
 
 **改完记得**：
-1. 先 `cp server.js server.js.bak-chatlog` 备份；
-2. `node -c server.js` 检查语法；
-3. 用 pm2 重启（`pm2 start server.js --name gateway --force`），**确认只有一个进程在跑**（重复启动会抢端口）；
-4. `pm2 save` 保存进程列表。
+1. 先备份原文件（`cp xxx.js xxx.js.bak`）；
+2. 检查语法（Node 用 `node -c xxx.js`）；
+3. 用进程管理器重启，**确认只有一个进程在跑**（重复启动会抢端口）；
+4. 保存进程列表（pm2 用 `pm2 save`）。
 
 **验证**：聊几句，然后查库——
 
