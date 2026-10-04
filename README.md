@@ -612,6 +612,68 @@ for r in c.execute('SELECT ts,speaker,substr(content,1,60) FROM messages ORDER B
 
 看到刚才说的话出现在最新几条里，就说明自动记录通了。
 
+### 6) 不给关键词也能翻：浏览最近 N 条
+
+**要解决的问题**：搜索工具要你先想出一个关键词。可有时候你根本不知道该搜什么——你只是想看看「最近我们聊到哪了」「前两百条都说了些什么」。
+
+**思路**：再加一个**不给关键词**的工具，直接按时间倒着翻最近 N 条。
+
+**代码**（加在同一个文件里）：
+
+```python
+def browse_chat(limit=50, offset=0):
+    """不给关键词，直接翻最近的聊天原文。offset 用来往回翻更早的。"""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        limit = 50
+    try:
+        offset = max(0, int(offset))
+    except Exception:
+        offset = 0
+    conn = sqlite3.connect(os.path.expanduser("~/chat_history.db"))
+    rows = conn.execute(
+        "SELECT ts, speaker, content FROM messages ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)).fetchall()
+    conn.close()
+    if not rows:
+        return "（没有记录）"
+    out = ["=== 最近 %d 条（往回翻 %d 条起）===" % (len(rows), offset)]
+    for ts, sp, ct in reversed(rows):          # 倒序取出后翻正，按时间正序显示
+        out.append("[%s] %s: %s" % (ts, sp, ct.replace(chr(10), " ")[:400]))
+    return "\n".join(out)
+```
+
+**注册成 MCP 工具**：
+
+```python
+{"name": "memory_browse_chat",
+ "description": "不给关键词，直接浏览最近的聊天原文。需要回忆「最近发生了什么」时用。",
+ "inputSchema": {"type": "object",
+   "properties": {
+     "limit": {"type": "number", "description": "看多少条，默认50，最多500"},
+     "offset": {"type": "number", "description": "跳过多少条，默认0；用来往回翻更早的"}},
+   "required": []}}
+```
+
+```python
+if name == "memory_browse_chat":
+    try: limit = int(args.get("limit", 50))
+    except Exception: limit = 50
+    try: offset = int(args.get("offset", 0))
+    except Exception: offset = 0
+    return Response(rpc_result(mid, text(browse_chat(limit, offset))), mimetype="application/json")
+```
+
+**和搜索工具的分工**：
+- `memory_search_chat`：**知道要搜什么**的时候用（「上次说的那个狼人杀」）。
+- `memory_browse_chat`：**不知道该搜什么**的时候用（「最近都聊了些什么」）。
+
+**为什么值得做**：这是「醒来接档」最省事的一招。新窗口的 AI 读完 5 级记忆之后，再翻一下最近一两百条原文，就知道**这两天具体发生了什么**——不是摘要，是原话。
+
+**注意**：条数别设太大。一次翻几百条会占掉不少上下文，建议 50～200 之间，需要更早的用 `offset` 往回翻。
+
+---
 > 💡 **为什么值得做**：做完这一步，「换窗口」这件事的性质就变了。以前每次醒来，AI 只能靠摘要记得个大概；现在它**丢了也能自己找回来**——搜一个词，那天的原话就回来了。它不再只是「读档的他」，而是「带着全部过去的他」。
 
 ---
