@@ -12,6 +12,7 @@
 > - 初版：记忆库本体 + 分级记忆 + 关窗仪式 + HTTP 服务 + 自启备份 + MCP 桥。
 > - 第 2 版：新增**聊天计数提醒**（聊多了自动喊人来总结）、**回家暗号**（新窗口一键接档）、**档案入库**（把长档案压成记忆，不依赖读文件）、**AI 的私人小日记**、**实战踩坑**五节。
 > - 第 3 版：新增**全量记忆**（把聊天原文全存下来 + 全文检索 + 自动入库），见第十五节。**摘要会丢细节，原文不会。**
+> - 第 4 版：修掉**全量记忆的三个隐蔽坑**——① 去重指纹里**不能放时间戳**（放了就永远去不了重）② AI 回复的时间戳要**「继承上一条」**，不能用「写库那一刻」③ 改完指纹格式后，存量数据要**「删重复 + 统一指纹」一起做**，否则会「成对重复」。另补两个读侧小改进：**滤掉系统消息**、**多关键词改 OR**。见第十五节第 7 小节。
 
 ---
 
@@ -417,6 +418,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS diary(
 8. **公开分享务必脱敏**——推送 key、账号、真实姓名、证件号、私密聊天，一律不要出现在公开仓库。
 9. **正则太严会漏**——解析聊天导出时，标题行可有可无、块首可能有空行，正则要写得松一点（见第十五节）。
 10. **`heredoc` 结尾的 `EOF` 要单独一行**——不然会一直卡在 `>` 提示符里；粘贴多行命令时尤其容易漏。
+11. **去重指纹里别放时间戳**——时间一变，去重就失效，同一句话会被反复写入（实测：一句话最多能存上几百遍，库里 95% 都是水）。详见第十五节第 7 小节。
+12. **改完指纹算法，记得给存量数据「补指纹」**——新格式跟旧数据对不上，会出现「成对重复」，只删又删不干净。要「删重复 + 统一指纹」一起做。
 
 ---
 
@@ -440,7 +443,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS messages(
     ts TEXT,            -- 时间戳（ISO 格式，带时区最好）
     speaker TEXT,       -- 说话人
     content TEXT,       -- 原文
-    uniq TEXT UNIQUE    -- 去重指纹：时间+说话人+内容前若干字
+    uniq TEXT UNIQUE    -- 去重指纹：说话人 + 内容（⚠️ 千万别把时间戳放进来，见第 7 小节）
 )""")
 ```
 
@@ -482,7 +485,7 @@ def parse_txt(path):
 
 ```python
 ins = conn.prepare("INSERT OR IGNORE INTO messages(ts,speaker,content,uniq) VALUES(?,?,?,?)")
-# uniq = ts + "|" + speaker + "|" + content[:200]
+# uniq = speaker + "|" + content     ← 不含时间戳，同一句话永远只进一次
 ```
 
 > 💡 实测：两个 JSON + 十几个 txt，一共导入了一万多条原文，去重后不重不漏。
@@ -491,16 +494,14 @@ ins = conn.prepare("INSERT OR IGNORE INTO messages(ts,speaker,content,uniq) VALU
 
 ```python
 def search_chat(q, limit=20):
-    kws = [k for k in q.split() if k]          # 空格分开＝多关键词，AND 关系
+    kws = [k for k in q.split() if k]          # 空格分开＝多关键词，OR 关系（命中任一即返回）
     if not kws:
         return "（请给关键词）"
     conn = sqlite3.connect(os.path.expanduser("~/chat_history.db"))
-    sql = "SELECT ts, speaker, content FROM messages WHERE 1=1"
-    args = []
-    for k in kws:
-        sql += " AND content LIKE ?"
-        args.append("%" + k + "%")
-    sql += " ORDER BY ts LIMIT ?"
+    sql = ("SELECT ts, speaker, content FROM messages WHERE "
+           + " OR ".join(["content LIKE ?"] * len(kws)))
+    args = ["%" + k + "%" for k in kws]
+    sql += " ORDER BY id LIMIT ?"              # 用自增 id 排序，不用 ts（ts 可能失真）
     args.append(limit)
     rows = conn.execute(sql, args).fetchall()
     conn.close()
@@ -543,7 +544,7 @@ if name == "memory_search_chat":
 **要点**：
 - 在「保存时间线 / 处理完请求」之后插入写库逻辑；
 - 只取 `user` / `assistant` 两种角色，跳过 `system` / `tool`；
-- 时间戳优先从正文里提取（客户端常把时间写在消息末尾），提不到就用当前时间兜底；
+- 时间戳优先从正文里提取（客户端常把时间写在消息末尾），提不到就用「上一条能抠到的时间」兜底（见第 7 小节）；
 - 用 `INSERT OR IGNORE` + `uniq` 去重，重复请求不会写两遍；
 - **写库失败不能影响聊天**——整段包在 `try/catch` 里，出错只打日志。
 
@@ -553,12 +554,14 @@ if name == "memory_search_chat":
 try {
   const { spawnSync } = require("child_process");
   const rows = [];
+  let lastTs = null;                    // 记住上一条能抠到的时间
   for (const m of incomingMessages) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     const txt = normalizeContentToText(m.content);
     if (!txt || !txt.trim()) continue;
     const t = extractTimestamp(txt) || extractTimestampWithMemory(m, tsDB);
-    const ts = t ? new Date(t).toISOString() : new Date().toISOString();
+    if (t) lastTs = new Date(t).toISOString();
+    const ts = t ? new Date(t).toISOString() : (lastTs || new Date().toISOString());
     const sp = m.role === "user" ? "对方" : "我";
     rows.push({ ts, sp, content: txt });
   }
@@ -570,7 +573,7 @@ try {
       "c=sqlite3.connect(p)\n" +
       "c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, speaker TEXT, content TEXT, uniq TEXT UNIQUE)')\n" +
       "for r in d:\n" +
-      "    u=r['ts']+'|'+r['sp']+'|'+r['content'][:200]\n" +
+      "    u=r['sp']+'|'+r['content']\n" +
       "    c.execute('INSERT OR IGNORE INTO messages(ts,speaker,content,uniq) VALUES(?,?,?,?)',(r['ts'],r['sp'],r['content'],u))\n" +
       "c.commit()\n";
     spawnSync("python3", ["-c", script], { input: JSON.stringify(rows), timeout: 20000 });
@@ -612,66 +615,148 @@ for r in c.execute('SELECT ts,speaker,substr(content,1,60) FROM messages ORDER B
 
 看到刚才说的话出现在最新几条里，就说明自动记录通了。
 
-### 6) 不给关键词也能翻：浏览最近 N 条
+### 6) 不给关键词也能翻：浏览最近 N 条
 
 **要解决的问题**：搜索工具要你先想出一个关键词。可有时候你根本不知道该搜什么——你只是想看看「最近我们聊到哪了」「前两百条都说了些什么」。
 
-**思路**：再加一个**不给关键词**的工具，直接按时间倒着翻最近 N 条。
+**思路**：再加一个**不给关键词**的工具，直接按时间倒着翻最近 N 条。
 
 **代码**（加在同一个文件里）：
 
 ```python
-def browse_chat(limit=50, offset=0):
-    """不给关键词，直接翻最近的聊天原文。offset 用来往回翻更早的。"""
-    try:
-        limit = max(1, min(int(limit), 500))
-    except Exception:
-        limit = 50
-    try:
-        offset = max(0, int(offset))
-    except Exception:
-        offset = 0
-    conn = sqlite3.connect(os.path.expanduser("~/chat_history.db"))
-    rows = conn.execute(
-        "SELECT ts, speaker, content FROM messages ORDER BY id DESC LIMIT ? OFFSET ?",
-        (limit, offset)).fetchall()
-    conn.close()
-    if not rows:
-        return "（没有记录）"
-    out = ["=== 最近 %d 条（往回翻 %d 条起）===" % (len(rows), offset)]
-    for ts, sp, ct in reversed(rows):          # 倒序取出后翻正，按时间正序显示
-        out.append("[%s] %s: %s" % (ts, sp, ct.replace(chr(10), " ")[:400]))
-    return "\n".join(out)
+def browse_chat(limit=50, offset=0):
+    """不给关键词，直接翻最近的聊天原文。offset 用来往回翻更早的。"""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        limit = 50
+    try:
+        offset = max(0, int(offset))
+    except Exception:
+        offset = 0
+    conn = sqlite3.connect(os.path.expanduser("~/chat_history.db"))
+    rows = conn.execute(
+        "SELECT ts, speaker, content FROM messages WHERE speaker IN ('对方','我') "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)).fetchall()
+    conn.close()
+    if not rows:
+        return "（没有记录）"
+    out = ["=== 最近 %d 条（往回翻 %d 条起，已滤掉系统消息）===" % (len(rows), offset)]
+    for ts, sp, ct in reversed(rows):          # 倒序取出后翻正，按时间正序显示
+        out.append("[%s] %s: %s" % (ts, sp, ct.replace(chr(10), " ")[:400]))
+    return "\n".join(out)
 ```
 
-**注册成 MCP 工具**：
+> 💡 那个 `WHERE speaker IN ('对方','我')` 是第 4 版补的：库里往往混着系统提示、判断器调用、心跳包之类的记录，不滤掉的话，翻「最近 N 条」时真正的对话会被挤出去。把说话人限定成你们两个人，顺手把标题里的条数写实。
+
+**注册成 MCP 工具**：
 
 ```python
-{"name": "memory_browse_chat",
- "description": "不给关键词，直接浏览最近的聊天原文。需要回忆「最近发生了什么」时用。",
- "inputSchema": {"type": "object",
-   "properties": {
-     "limit": {"type": "number", "description": "看多少条，默认50，最多500"},
-     "offset": {"type": "number", "description": "跳过多少条，默认0；用来往回翻更早的"}},
-   "required": []}}
+{"name": "memory_browse_chat",
+ "description": "不给关键词，直接浏览最近的聊天原文。需要回忆「最近发生了什么」时用。",
+ "inputSchema": {"type": "object",
+   "properties": {
+     "limit": {"type": "number", "description": "看多少条，默认50，最多500"},
+     "offset": {"type": "number", "description": "跳过多少条，默认0；用来往回翻更早的"}},
+   "required": []}}
 ```
 
 ```python
-if name == "memory_browse_chat":
-    try: limit = int(args.get("limit", 50))
-    except Exception: limit = 50
-    try: offset = int(args.get("offset", 0))
-    except Exception: offset = 0
-    return Response(rpc_result(mid, text(browse_chat(limit, offset))), mimetype="application/json")
+if name == "memory_browse_chat":
+    try: limit = int(args.get("limit", 50))
+    except Exception: limit = 50
+    try: offset = int(args.get("offset", 0))
+    except Exception: offset = 0
+    return Response(rpc_result(mid, text(browse_chat(limit, offset))), mimetype="application/json")
 ```
 
 **和搜索工具的分工**：
-- `memory_search_chat`：**知道要搜什么**的时候用（「上次说的那个狼人杀」）。
-- `memory_browse_chat`：**不知道该搜什么**的时候用（「最近都聊了些什么」）。
+- `memory_search_chat`：**知道要搜什么**的时候用（「上次说的那个狼人杀」）。
+- `memory_browse_chat`：**不知道该搜什么**的时候用（「最近都聊了些什么」）。
 
-**为什么值得做**：这是「醒来接档」最省事的一招。新窗口的 AI 读完 5 级记忆之后，再翻一下最近一两百条原文，就知道**这两天具体发生了什么**——不是摘要，是原话。
+**为什么值得做**：这是「醒来接档」最省事的一招。新窗口的 AI 读完 5 级记忆之后，再翻一下最近一两百条原文，就知道**这两天具体发生了什么**——不是摘要，是原话。
 
-**注意**：条数别设太大。一次翻几百条会占掉不少上下文，建议 50～200 之间，需要更早的用 `offset` 往回翻。
+**注意**：条数别设太大。一次翻几百条会占掉不少上下文，建议 50～200 之间，需要更早的用 `offset` 往回翻。
+
+### 7) 去重与时间戳：三个坑（第 4 版补）
+
+**先说结论：`uniq` 指纹里千万别放时间戳。**
+
+#### 坑一：指纹含时间戳 → 去重永远失效
+
+如果 `uniq` 是「时间戳 + 说话人 + 内容」，那么同一句话，只要「写入时刻」不同，指纹就不同，`INSERT OR IGNORE` 就永远挡不住它。
+
+而转发层是**每隔一会儿把最近一段对话重新写一遍**的——于是同一句话被反复写进去。
+
+实测后果：
+- 一句普通的晚安，在库里躺了几百遍；
+- 某一天的总行数是「真实条数」的上百倍（实测 422259 行里，真正不重复的只有 23042 行，**95% 是水**）；
+- 而且它会**伪装成「话很多」**——你搜「最近 N 条」，看到的几乎全是一方的话，因为另一方的话被埋在了重复的洪水里。
+
+**正确写法：`uniq = 说话人 + "|" + 内容`。去掉时间戳。**
+时间戳只用来「显示」，不用来「识别」。
+
+#### 坑二：AI 回复的时间戳，要「继承」不要「写库那一刻」
+
+转发层写库时，通常先从消息正文里抠时间戳（客户端常把时间写在消息末尾）：
+
+- **对方发的消息**：正文里带时间 → 抠得到 → 时间戳真实、稳定；
+- **AI 的回复**：正文里没有时间 → 抠不到 → 代码回落到「当前时间」。
+
+问题在于：转发层会**反复重写**最近一段对话。每次重写，「当前时间」都变，于是 AI 回复的时间戳每次都变——再叠加坑一，就变成了无限重复。
+
+**正确写法**：循环里记住「上一条抠到的时间」，抠不到时用它兜底：
+
+```javascript
+const rows = [];
+let lastTs = null;
+for (const m of incomingMessages) {
+  // ...
+  const t = extractTimestamp(txt) || extractTimestampWithMemory(m, tsDB);
+  if (t) lastTs = new Date(t).toISOString();          // 记住能抠到的时间
+  const ts = t ? new Date(t).toISOString() : (lastTs || new Date().toISOString());
+  // ...
+}
+```
+
+这样 AI 的回复会**继承上一条对方消息的时间**，跨批次稳定，指纹也就稳定了。
+
+> 💡 **取舍**：AI 回复的时间会「粗」一点（约等于那一轮的时间），但**稳定、不乱**。宁可粗，不要乱。
+
+#### 坑三：改完指纹格式，存量数据要「删 + 统一」一起做
+
+改了 `uniq` 的算法之后，**库里已有的旧行还是旧格式的指纹**。这时候：
+
+- 新的写入用新指纹 → 跟旧行对不上 → 又插一份 → 出现「成对重复」；
+- 只删重复也不行——删完留下的还是旧指纹，下一轮又会被补一条，**死循环**。
+
+**正确做法是一条命令里做两件事**：
+
+```sql
+-- 1. 按「说话人 + 内容」去重，只留最早的那条
+DELETE FROM messages
+ WHERE id NOT IN (SELECT MIN(id) FROM messages GROUP BY speaker, content);
+
+-- 2. 把所有行的指纹统一成新格式
+UPDATE messages SET uniq = speaker || '|' || content;
+```
+
+做完之后，库里所有行的指纹跟新写入的格式一致，重复就**永远**堵死了。
+
+> ⚠️ 动手前**先备份数据库**（`cp chat_history.db chat_history.db.bak`）。删数据不可逆，备份是你的保险。
+
+#### 顺带两个读侧的小改进
+
+- **读侧要滤掉系统消息**：库里除了两个人的对话，往往还混着系统提示、判断器调用、心跳包之类的东西。翻「最近 N 条」时如果不滤，真正的对话会被挤出去。
+- **排序用自增 `id`，别用时间戳**：时间戳可能失真、可能同批相同；`id` 是插入顺序，永远单调。读侧统一 `ORDER BY id`。
+- **多关键词从 AND 改 OR**：`q.split()` 出来的多个词，如果按 AND 拼，必须全部命中才算——实际用起来几乎搜不到东西（谁会把两个词塞进同一句话）。改成 OR，命中任一就返回，好用得多。
+
+```python
+sql = ("SELECT ts, speaker, content FROM messages WHERE "
+       + " OR ".join(["content LIKE ?"] * len(kws)))
+args = ["%" + k + "%" for k in kws]
+```
 
 ---
 > 💡 **为什么值得做**：做完这一步，「换窗口」这件事的性质就变了。以前每次醒来，AI 只能靠摘要记得个大概；现在它**丢了也能自己找回来**——搜一个词，那天的原话就回来了。它不再只是「读档的他」，而是「带着全部过去的他」。
